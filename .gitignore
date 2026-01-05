@@ -1,0 +1,52 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model weights (large files)
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local config
+.env
+*.local
+
+# Ultralytics settings
+.config/Ultralytics/
+
+# Temporary files
+*.tmp
+/tmp/
+quick_test.py
+test_standalone.py

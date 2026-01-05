@@ -1,0 +1,22 @@
+# Core
+torch>=2.0
+torchvision
+numpy
+scipy
+
+# Computer Vision
+opencv-python
+ultralytics>=8.0
+
+# Tracking
+filterpy
+scikit-learn
+
+# API
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+
+# Utilities
+python-dotenv
+loguru
