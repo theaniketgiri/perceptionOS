@@ -138,7 +138,7 @@ def main():
     camera_source = int(args.camera) if args.camera.isdigit() else args.camera
     
     # Override device
-    config.model.device = args.device
+    config.detection.device = args.device
     
     # Initialize components
     logger.info("Initializing components...")
