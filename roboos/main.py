@@ -47,6 +47,10 @@ def run_perception_loop(
     
     logger.info("Starting perception loop")
     
+    # FPS logging state
+    last_fps_log = time.time()
+    fps_log_interval = 2.0  # Log FPS every 2 seconds
+    
     with camera:
         while _running:
             # Read frame
@@ -58,6 +62,13 @@ def run_perception_loop(
             
             # Process frame
             world_state = world_state_manager.process_frame(frame)
+            
+            # Log FPS periodically
+            if time.time() - last_fps_log >= fps_log_interval:
+                fps = world_state_manager.fps
+                obj_count = len(world_state.objects)
+                logger.info(f"FPS: {fps:.1f} | Objects: {obj_count}")
+                last_fps_log = time.time()
             
             # Visualize if enabled
             if not headless and visualizer is not None:

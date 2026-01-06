@@ -24,6 +24,7 @@ from loguru import logger
 from roboos.config import config
 from roboos.perception.detector import Detection
 from roboos.tracking.kalman import KalmanFilter
+from roboos.tracking.reid_gallery import ReIDGallery
 
 
 # =============================================================================
@@ -36,9 +37,9 @@ COST_WEIGHT_EMBEDDING: Final[float] = 0.35  # Adjusted
 COST_WEIGHT_CLASS: Final[float] = 0.15      # Reduced from 0.2
 
 # Thresholds for matching decisions
-MATCH_COST_THRESHOLD: Final[float] = 0.8  # Below this = valid match
+MATCH_COST_THRESHOLD: Final[float] = 1.0  # Below this = valid match (increased for V-JEPA)
 IDENTITY_CONFIDENCE_THRESHOLD: Final[float] = 0.5  # Below this = uncertain match
-EMBEDDING_SIMILARITY_MIN: Final[float] = 0.3  # Below this = reject match
+EMBEDDING_SIMILARITY_MIN: Final[float] = 0.2  # Below this = reject match (lowered for V-JEPA)
 
 # Position normalization factor (pixels)
 POSITION_NORM_FACTOR: Final[float] = 500.0
@@ -197,7 +198,7 @@ class Tracker:
     __slots__ = (
         '_objects', '_next_id', '_frame_id', '_max_age', '_min_hits',
         '_iou_threshold', '_embedding_threshold', '_occlusion_threshold',
-        '_uncertain_threshold', '_lost_threshold'
+        '_uncertain_threshold', '_lost_threshold', '_reid_gallery'
     )
     
     def __init__(self) -> None:
@@ -214,6 +215,7 @@ class Tracker:
         self._occlusion_threshold: int = config.tracker.occlusion_threshold_ms
         self._uncertain_threshold: int = config.tracker.uncertain_threshold_ms
         self._lost_threshold: int = config.tracker.lost_threshold_ms
+        self._reid_gallery: ReIDGallery = ReIDGallery()
     
     def _generate_id(self) -> str:
         """
@@ -536,12 +538,38 @@ class Tracker:
         """
         Create a new track from an unmatched detection.
         
+        CRITICAL: Before creating a new ID, check the Re-ID gallery
+        for a matching lost object. If found, resurrect the old ID.
+        
         New tracks start with:
             - identity_confidence = 1.0 (we're certain of new identity)
             - state = TRACKED
             - hits = 1
         """
-        obj_id = self._generate_id()
+        # PHASE 1: Check Re-ID gallery for potential match
+        gallery_match = self._reid_gallery.find_match(
+            embedding=detection.embedding,
+            class_id=detection.class_id,
+            position=detection.center,
+            current_timestamp_ms=timestamp_ms
+        )
+        
+        if gallery_match is not None:
+            # RESURRECTION: Re-use old ID instead of creating new
+            obj_id = gallery_match.object_id
+            self._reid_gallery.remove(obj_id)  # Remove from gallery
+            
+            logger.info(
+                f"Frame {self._frame_id}: RESURRECTED {obj_id} "
+                f"({detection.class_name}) - Re-ID match!"
+            )
+        else:
+            # No gallery match - create new ID
+            obj_id = self._generate_id()
+            logger.info(
+                f"Frame {self._frame_id}: Created track {obj_id} "
+                f"({detection.class_name} @ [{detection.center[0]:.0f}, {detection.center[1]:.0f}])"
+            )
         
         embedding = None
         if detection.embedding is not None:
@@ -554,7 +582,7 @@ class Tracker:
             embedding=embedding,
             state=ObjectState.TRACKED,
             confidence=detection.confidence,
-            identity_confidence=1.0,  # New track = certain identity
+            identity_confidence=1.0 if gallery_match is None else 0.8,  # Slightly lower for resurrected
             last_seen_ms=timestamp_ms,
             created_at_ms=timestamp_ms,
             hits=1,
@@ -565,11 +593,6 @@ class Tracker:
         obj.kalman.initialize(float(center[0]), float(center[1]))
         
         self._objects[obj_id] = obj
-        
-        logger.info(
-            f"Frame {self._frame_id}: Created track {obj_id} "
-            f"({detection.class_name} @ [{center[0]:.0f}, {center[1]:.0f}])"
-        )
     
     def _handle_unmatched_track(self, obj_id: str, timestamp_ms: int) -> None:
         """
@@ -634,13 +657,31 @@ class Tracker:
             logger.info(f"{obj_id}: Marked LOST after {time_since_seen}ms")
     
     def _remove_lost_tracks(self) -> None:
-        """Remove tracks that have been lost."""
+        """
+        Remove tracks that have been lost.
+        
+        CRITICAL: Before removing, store the embedding in the Re-ID gallery
+        so we can resurrect this ID if the object reappears.
+        """
         lost_ids = [
             obj_id for obj_id, obj in self._objects.items()
             if obj.state == ObjectState.LOST or obj.misses > self._max_age
         ]
         
         for obj_id in lost_ids:
+            obj = self._objects[obj_id]
+            
+            # Store in Re-ID gallery for potential resurrection
+            if obj.embedding is not None:
+                self._reid_gallery.add(
+                    object_id=obj_id,
+                    class_id=obj.class_id,
+                    class_name=obj.class_name,
+                    embedding=obj.embedding,
+                    last_position=obj.position,
+                    lost_timestamp_ms=obj.last_seen_ms
+                )
+            
             logger.info(f"Frame {self._frame_id}: Removing {obj_id}")
             del self._objects[obj_id]
     

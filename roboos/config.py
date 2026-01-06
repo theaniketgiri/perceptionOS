@@ -151,6 +151,25 @@ class TrackerConfig:
 
 
 @dataclass
+class EncoderConfig:
+    """Semantic encoder configuration."""
+    # Encoder type: "histogram" (fast, real-time) or "vjepa" (slow, better quality)
+    # Default: histogram for real-time FPS on RTX 3050
+    encoder_type: str = "histogram"
+    
+    # V-JEPA model variants:
+    # - "facebook/vjepa2-vitl-fpc64-256" (large, recommended)
+    # - "facebook/vjepa2-vitg-fpc64-384-ssv2" (giant, best quality)
+    vjepa_model: str = "facebook/vjepa2-vitl-fpc64-256"
+    
+    # Embedding dimension (auto-detected from model)
+    embedding_dim: int = 384
+    
+    # Device for encoder inference
+    device: str = "cuda"
+
+
+@dataclass
 class APIConfig:
     """API server configuration."""
     host: str = "0.0.0.0"
@@ -171,6 +190,7 @@ class Config:
     """
     camera: CameraConfig = field(default_factory=CameraConfig)
     detection: DetectionConfig = field(default_factory=DetectionConfig)
+    encoder: EncoderConfig = field(default_factory=EncoderConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
     api: APIConfig = field(default_factory=APIConfig)
     
@@ -207,6 +227,9 @@ class Config:
         
         if os.getenv("DETECTION_CONFIDENCE"):
             config.detection.confidence = float(os.getenv("DETECTION_CONFIDENCE"))
+        
+        if os.getenv("ENCODER_TYPE"):
+            config.encoder.encoder_type = os.getenv("ENCODER_TYPE").lower()
         
         return config
 
