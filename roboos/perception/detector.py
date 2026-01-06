@@ -4,11 +4,11 @@ Object detector using YOLO for bounding box detection.
 Responsibilities:
     1. Run YOLO inference on camera frames
     2. Filter detections by class (only track dynamic objects)
-    3. Extract embeddings for re-identification
+    3. Use semantic encoder for embedding extraction
 
 Design Notes:
     - Detection filtering happens at this layer, not in tracker
-    - Embeddings use histogram for MVP (OSNet for production)
+    - Embeddings use pluggable encoder (V-JEPA or histogram fallback)
     - All CUDA operations happen here
 
 Author: Perception OS Team
@@ -26,14 +26,17 @@ from ultralytics import YOLO
 from loguru import logger
 
 from roboos.config import config
+from roboos.perception.encoder import (
+    Encoder, create_encoder, EncoderConfig, EncoderType,
+    HistogramEncoder, VJEPAEncoder
+)
 
 
 # =============================================================================
 # Constants
 # =============================================================================
 
-EMBEDDING_CROP_SIZE: Final[int] = 64
-HISTOGRAM_BINS: Final[int] = 32
+MIN_CROP_SIZE: Final[int] = 10  # Minimum crop size in pixels
 
 
 # =============================================================================
@@ -94,22 +97,22 @@ class Detection:
 
 class Detector:
     """
-    Object detector using YOLOv8 with class filtering.
+    Object detector using YOLOv8 with semantic encoder.
     
     Features:
         - CUDA-accelerated inference
         - Configurable class filtering (only track dynamic objects)
-        - Histogram-based embeddings for re-identification
+        - Pluggable encoder: V-JEPA for semantic embeddings, histogram fallback
     
     Usage:
         detector = Detector()
         detector.load()
-        detections = detector.detect(frame)  # Already filtered
+        detections = detector.detect(frame)  # Already filtered with embeddings
     """
     
     __slots__ = (
         'model_path', 'confidence_threshold', 'device',
-        '_model', '_class_names', '_filter_enabled'
+        '_model', '_class_names', '_filter_enabled', '_encoder'
     )
     
     def __init__(
@@ -133,35 +136,81 @@ class Detector:
         self._model: Optional[YOLO] = None
         self._class_names: dict[int, str] = {}
         self._filter_enabled = config.detection.filter_enabled
+        self._encoder: Optional[Encoder] = None
     
     def load(self) -> bool:
         """
-        Load the YOLO model onto the specified device.
+        Load the YOLO model and encoder onto the specified device.
         
         Returns:
             True if successful, False otherwise
         """
         try:
+            # Load YOLO detector
             logger.info(f"Loading detector model: {self.model_path}")
             self._model = YOLO(self.model_path)
             self._model.to(self.device)
             self._class_names = self._model.names
             
-            # Log configuration
             logger.info(f"Detector loaded on {self.device}, classes: {len(self._class_names)}")
             
             if self._filter_enabled:
                 from roboos.config import get_allowed_class_names
                 allowed = get_allowed_class_names()
                 logger.info(f"Class filter enabled, tracking: {allowed}")
-            else:
-                logger.info("Class filter disabled, tracking all classes")
+            
+            # Load semantic encoder
+            self._load_encoder()
             
             return True
             
         except Exception as e:
             logger.error(f"Failed to load detector: {e}")
             return False
+    
+    def _load_encoder(self) -> None:
+        """Load the semantic encoder based on configuration."""
+        encoder_type = config.encoder.encoder_type.lower()
+        
+        try:
+            if encoder_type == "vjepa":
+                self._encoder = VJEPAEncoder(
+                    model_name=config.encoder.vjepa_model,
+                    device=config.encoder.device
+                )
+                if not self._encoder.load():
+                    raise RuntimeError("V-JEPA load failed")
+                logger.info(f"V-JEPA encoder loaded: {config.encoder.vjepa_model}")
+                
+            elif encoder_type == "histogram":
+                self._encoder = HistogramEncoder(
+                    embedding_dim=config.encoder.embedding_dim
+                )
+                self._encoder.load()
+                logger.info("Histogram encoder loaded")
+                
+            else:  # auto mode
+                logger.info("Encoder: auto mode, trying V-JEPA...")
+                try:
+                    self._encoder = VJEPAEncoder(
+                        model_name=config.encoder.vjepa_model,
+                        device=config.encoder.device
+                    )
+                    if self._encoder.load():
+                        logger.info(f"V-JEPA encoder loaded: {config.encoder.vjepa_model}")
+                    else:
+                        raise RuntimeError("V-JEPA load returned False")
+                except Exception as e:
+                    logger.warning(f"V-JEPA unavailable ({e}), using histogram encoder")
+                    self._encoder = HistogramEncoder(
+                        embedding_dim=config.encoder.embedding_dim
+                    )
+                    self._encoder.load()
+                    
+        except Exception as e:
+            logger.error(f"Encoder load failed: {e}, using histogram fallback")
+            self._encoder = HistogramEncoder(embedding_dim=config.encoder.embedding_dim)
+            self._encoder.load()
     
     def detect(self, frame) -> List[Detection]:
         """
@@ -177,14 +226,18 @@ class Detector:
             logger.error("Detector not loaded. Call load() first.")
             return []
         
-        # Run inference
+        image = frame.image
+        
+        # Run YOLO inference
         results = self._model(
-            frame.image,
+            image,
             conf=self.confidence_threshold,
             verbose=False
         )
         
-        detections: List[Detection] = []
+        # Collect valid detections and their crops
+        detections_data: List[tuple] = []  # (bbox, class_id, confidence, class_name)
+        crops: List[np.ndarray] = []
         filtered_count = 0
         
         for result in results:
@@ -193,7 +246,6 @@ class Detector:
             if boxes is None or len(boxes) == 0:
                 continue
             
-            # Extract arrays from YOLO output
             xyxy = boxes.xyxy.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
             cls_ids = boxes.cls.cpu().numpy().astype(int)
@@ -206,83 +258,51 @@ class Detector:
                     filtered_count += 1
                     continue
                 
-                bbox = xyxy[i]
+                bbox = xyxy[i].astype(np.float32)
                 confidence = float(confs[i])
                 class_name = self._class_names.get(class_id, f"class_{class_id}")
                 
-                # Extract embedding for re-identification
-                embedding = self._extract_embedding(frame.image, bbox)
+                # Extract crop for embedding
+                crop = self._extract_crop(image, bbox)
                 
-                detection = Detection(
-                    bbox=bbox.astype(np.float32),
-                    class_id=class_id,
-                    class_name=class_name,
-                    confidence=confidence,
-                    embedding=embedding
-                )
-                detections.append(detection)
+                detections_data.append((bbox, class_id, confidence, class_name))
+                crops.append(crop)
         
-        # Log if we filtered anything (debug level)
+        # Batch encode all crops
+        if crops and self._encoder is not None:
+            embeddings = self._encoder.encode(crops)
+        else:
+            embeddings = np.zeros((len(crops), self._encoder.embedding_dim if self._encoder else 64), dtype=np.float32)
+        
+        # Build Detection objects
+        detections: List[Detection] = []
+        for i, (bbox, class_id, confidence, class_name) in enumerate(detections_data):
+            detection = Detection(
+                bbox=bbox,
+                class_id=class_id,
+                class_name=class_name,
+                confidence=confidence,
+                embedding=embeddings[i] if i < len(embeddings) else None
+            )
+            detections.append(detection)
+        
         if filtered_count > 0:
             logger.debug(f"Filtered {filtered_count} static objects")
         
         return detections
     
-    def _extract_embedding(
-        self,
-        image: np.ndarray,
-        bbox: np.ndarray
-    ) -> np.ndarray:
-        """
-        Extract a feature embedding from a detection region.
-        
-        For MVP: Uses color histogram (HSV)
-        For Production: Would use OSNet, FastReID, or similar
-        
-        Args:
-            image: Full BGR image
-            bbox: Bounding box [x1, y1, x2, y2]
-            
-        Returns:
-            Normalized feature vector
-        """
-        # Clip bbox to image bounds
+    def _extract_crop(self, image: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+        """Extract object crop from image."""
         h, w = image.shape[:2]
         x1 = int(max(0, bbox[0]))
         y1 = int(max(0, bbox[1]))
         x2 = int(min(w, bbox[2]))
         y2 = int(min(h, bbox[3]))
         
-        # Handle degenerate boxes
-        if x2 <= x1 or y2 <= y1:
-            return np.zeros(config.detection.embedding_dim, dtype=np.float32)
+        if x2 - x1 < MIN_CROP_SIZE or y2 - y1 < MIN_CROP_SIZE:
+            return np.zeros((MIN_CROP_SIZE, MIN_CROP_SIZE, 3), dtype=np.uint8)
         
-        # Crop and resize
-        crop = image[y1:y2, x1:x2]
-        crop = cv2.resize(crop, (EMBEDDING_CROP_SIZE, EMBEDDING_CROP_SIZE))
-        
-        # Convert to HSV for color histogram
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        
-        # Compute histograms for H and S channels
-        h_hist = cv2.calcHist([hsv], [0], None, [HISTOGRAM_BINS], [0, 180])
-        s_hist = cv2.calcHist([hsv], [1], None, [HISTOGRAM_BINS], [0, 256])
-        
-        # Normalize histograms
-        cv2.normalize(h_hist, h_hist)
-        cv2.normalize(s_hist, s_hist)
-        
-        # Combine into embedding
-        embedding = np.concatenate([h_hist.flatten(), s_hist.flatten()])
-        
-        # Pad or truncate to target dimension
-        target_dim = config.detection.embedding_dim
-        if len(embedding) < target_dim:
-            embedding = np.pad(embedding, (0, target_dim - len(embedding)))
-        else:
-            embedding = embedding[:target_dim]
-        
-        return embedding.astype(np.float32)
+        return image[y1:y2, x1:x2].copy()
     
     @property
     def class_names(self) -> dict[int, str]:
@@ -293,3 +313,10 @@ class Detector:
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
         return self._model is not None
+    
+    @property
+    def encoder_type(self) -> str:
+        """Get the type of encoder being used."""
+        if self._encoder is None:
+            return "none"
+        return type(self._encoder).__name__
